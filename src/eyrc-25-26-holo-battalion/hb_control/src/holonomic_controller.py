@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 
-'''
-This Python file runs a ROS 2 node of name holonomic_pid_controller which holds the position of a holonomic robot
-and drives it through a series of predefined goals using PID controllers on [x, y, θ].
-
-This node publishes and subscribes to the following topics:
-
-        PUBLICATIONS                               SUBSCRIPTIONS
-        /forward_velocity_controller/commands      /bot_pose
-
-Instead of defining separate variables for each PID axis, lists/dictionaries are used.
-For example: pid_params['x'], pid_params['y'], pid_params['theta'], etc.
-
-Code modularity and clarity are maintained to make tuning and extension easier.
-'''
-
 # ---------------------- Import Required Libraries ----------------------------
 import rclpy
 from rclpy.node import Node
@@ -218,40 +203,7 @@ class HolonomicPIDController(Node):
         if dt <= 0:
             return
         self.last_time = now
-        # ex = self.crate_x - self.pose_x
-        # ey = self.crate_y - self.pose_y
 
-                # ------------------ target selection ------------------
-        # Determine navigation target depending on mission state:
-        # - If not yet` attached -> target = crate_box (approach)
-        # - If attached and mission_flag == 1 -> target = D1 center (go to drop)
-        # - If mission_flag == 2 (dropped) -> target = dock
-        # - If perception publishes a path target, prefer that (self.path_target)
-
-
-        # if getattr(self, 'crate_cb', None) is not None:
-        #     # perception-generated path target (higher priority)
-        #     target_x = self.crate_x
-        #     target_y = self.crate_y
-        #     target_w = self.crate_w
-        #     self.get_logger().info(f"DBG target=({target_x:.1f},{target_y:.1f},yaw={math.degrees(target_w):.1f}), pose=({self.pose_x:.1f},{self.pose_y:.1f},yaw={math.degrees(self.pose_w):.1f})")
-
-        # else:
-        #     if self.attached and self.mission_flag == 1:
-        #         # go to D1 center
-        #         target_x = (self.D1['x_min'] + self.D1['x_max']) / 2.0
-        #         target_y = (self.D1['y_min'] + self.D1['y_max']) / 2.0
-        #         target_w = 0.0
-        #     elif self.mission_flag == 2 and not self.attached:
-        #         # after drop, return to dock
-        #         target_x = self.dock['x']
-        #         target_y = self.dock['y']
-        #         target_w = math.radians(self.dock.get('w', 0.0))
-        #     else:
-        #         # default: approach crate
-        #         target_x = getattr(self, 'crate_box_x', self.crate_x)
-        #         target_y = getattr(self, 'crate_box_y', self.crate_y)
-        #         target_w = self.crate_w
 
         # ---------- TARGET SELECTION (explicit, simple priority) ----------
         # If we've detached (mission_flag==2 and not attached) we *must* head to dock.
@@ -330,38 +282,6 @@ class HolonomicPIDController(Node):
         m2 = -D * w - 0.5 * VX - math.sin(math.pi / 3) * VY
         m3 = -D * w + 1 * VX
 
-                # --- SIMPLE DOCK ARRIVAL CHECK (replace existing complex logic) ---
-        # if (self.mission_flag == 2) and (not self.attached):
-        #     # simple Euclidean distance to dock
-        #     dock_dist = math.hypot(self.dock['x'] - self.pose_x, self.dock['y'] - self.pose_y)
-
-        #     # if within position AND angle tolerance -> stop and latch
-        #     if dock_dist <= self.dock_tolerance and abs(etheta) <= self.dock_angle_tol:
-        #         # stop motion immediately
-        #         m1 = m2 = m3 = 0.0
-        #         # base_angle = 0.0
-        #         # elbow_angle = 0.0
-
-        #         # clear controllers to avoid later wind-up / jerk
-        #         try:
-        #             self.pid_x.reset()
-        #             self.pid_y.reset()
-        #             self.pid_theta.reset()
-        #         except Exception:
-        #             pass
-
-        #         # mark stopped / at dock
-        #         self.at_dock = True
-        #         self.mission_flag = 3
-
-        #         # publish stop state once (uses your helper)
-        #         try:
-        #             self._publish_pick_status(3)
-        #         except Exception:
-        #             msg = Int8(); msg.data = 3; self.status_pub.publish(msg)
-
-        #         self.get_logger().info(f"Arrived at dock — stopping (dist={dock_dist:.2f}mm).")
-        #     # else: keep using computed m1/m2/m3 (no gentle slow-down here)
 
         # --- ROBUST DOCK ARRIVAL CHECK (improved) ---
         if (self.mission_flag == 2) and (not self.attached):
@@ -444,80 +364,6 @@ class HolonomicPIDController(Node):
                 f"VX: {VX:.2f}, VY: {VY:.2f}, w: {w:.2f}, Dist(crate): {bot_crate_dist:.2f}"
             )
 
-
-
-        # bot=np.array([self.pose_x, self.pose_y])
-        # crate=np.array([self.crate_box_x, self.crate_box_y])
-        # bot_crate_dist=np.linalg.norm(bot-crate)
-
-        # etheta = math.atan2(math.sin(self.crate_w - self.pose_w), math.cos(self.crate_w - self.pose_w))
-
-        # #Transform world error to body frame
-        # ex_b = math.cos(self.pose_w) * ex + math.sin(self.pose_w) * ey
-        # ey_b = -math.sin(self.pose_w) * ex + math.cos(self.pose_w) * ey
-
-        # #PID compute 
-        # VX = self.pid_x.compute(ex_b, dt)
-        # VY = self.pid_y.compute(ey_b, dt)
-        # w = self.pid_theta.compute(etheta, dt)
-
-        # #wheel velocity calculation
-        # D = 1
-
-        # m1 = -D * w - 0.5 * VX + math.sin(math.pi / 3) * VY
-        # m2 = -D * w - 0.5 * VX - math.sin(math.pi / 3) * VY
-        # m3 = -D * w + 1 * VX
-
-        # # # Normalize wheel speeds
-        # # wheel_speeds = [m1, m2, m3]
-        # # max_w = max(abs(w) for w in wheel_speeds)
-        # # if max_w > self.max_vel:
-        # #     scale = self.max_vel / max_w
-        # #     wheel_speeds = [w * scale for w in wheel_speeds]
-
-        # # Log the calculated velocities
-        # if bot_crate_dist <= 140 and not self.attached :
-        #     m1 = m2 = m3 = 0.0
-        #     base_angle = 90.0
-        #     elbow_angle = 90.0
-        #     self.get_logger().info(f" Crate reached — stopping motors (dist={bot_crate_dist:.2f})")
-
-        #     if not hasattr(self, 'attach_attempted') or not self.attach_attempted :
-        #         self.attach_attempted = True
-        #         self.get_logger().info("Attempting to attach crate")
-
-        #         self.call_attach_service()
-            
-
-        # elif self.attached :
-        #     base_angle = 20.0
-        #     elbow_angle = 20.0
-        #     self.get_logger().info("Crate attached - holding arm at 20")
-        #     m1 = m2 = m3 = 0.0
-
-        # if self.attached:
-        #     # existing arm/hold behavior (already in your file)
-        #     base_angle = 20.0
-        #     elbow_angle = 20.0
-        #     self.get_logger().info("Crate attached - holding arm at 20")
-        #     m1 = m2 = m3 = 0.0
-
-        # # check if we are inside D1 (use robot pose)NEEED TO CHECKKK
-        #     if (self.D1['x_min'] <= self.pose_x <= self.D1['x_max'] and
-        #         self.D1['y_min'] <= self.pose_y <= self.D1['y_max']):
-        #         self.get_logger().info("Inside D1 zone — attempting detach")
-        #         # only call detach once per arrival
-        #         if not getattr(self, 'detach_attempted', False):
-        #             self.detach_attempted = True
-        #             self.call_detach_service()
-
-        # else:
-        #     base_angle = 0.0
-        #     elbow_angle = 0.0
-        #     self.get_logger().info(
-        #         f"Wheel Velocities → m1: {m1:.2f}, m2: {m2:.2f}, m3: {m3:.2f}, "
-        #         f"VX: {VX:.2f}, VY: {VY:.2f}, w: {w:.2f}, Dist: {bot_crate_dist:.2f}"
-        #     )
 
         if (self.actual_crate_id%3 == 0):
             self.name="crate_red_"+str(self.actual_crate_id)
