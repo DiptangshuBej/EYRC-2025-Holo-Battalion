@@ -18,10 +18,13 @@ Code modularity and clarity are maintained to make tuning and extension easier.
 # ---------------------- Import Required Libraries ----------------------------
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
-# import hb_interface messages
+from std_msgs.msg import Bool
+from hb_interfaces.msg import BotCmdArray, BotCmd, Poses2D
+from linkattacher_msgs.srv import AttachLink, DetachLink
 import numpy as np
 import math
+import json
+from std_msgs.msg import Int8
 
 
 # ---------------------- PID Controller Class --------------------------------
@@ -35,6 +38,7 @@ class PID:
         self.prev_error = 0.0
 
     def compute(self, error, dt):
+        
 #-----------------------------PID Compute Steps--------------------------------------------------------------
         # 1. Accumulate the error over time for the Integral term
         # 2. Compute the change in error for the Derivative term
@@ -42,7 +46,14 @@ class PID:
         # 4. Store the current error for use in the next iteration
         # 5. Limit (clip) the output between [-max_out, +max_out] to avoid unsafe velocities
 #------------------------------------------------------------------------------------------------------------
-        return 
+        if dt <= 0.0:
+            derivative = 0.0
+        else:
+            derivative = (error - self.prev_error) / dt
+        self.integral += error * dt
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        self.prev_error = error
+        return max(min(output, self.max_out), -self.max_out)
     
     
     def reset(self):
@@ -54,6 +65,20 @@ class PID:
 class HolonomicPIDController(Node):
     def __init__(self):
         super().__init__('holonomic_pid_controller')  # initializing ros node
+
+        self.pose_id = None
+        self.pose_x = None
+        self.pose_y = None
+        self.pose_w = None
+        self.crate_id = None
+        self.crate_x = None
+        self.crate_y = None
+        self.crate_w = None
+        self._last_published_status = None   # remember last pick_status we published 
+        self.dock_tolerance = 30         # mm, positional tolerance to consider "at dock" (tune)
+        self.dock_angle_tol = math.radians(5)  # rad, yaw tolerance to consider aligned (tune)
+        self.at_dock = False                 # true once we've stopped at the dock
+
 
         # ---------------- Robot Parameters ----------------
         # 1. Robot ID(s)
@@ -69,22 +94,14 @@ class HolonomicPIDController(Node):
 
         # ---------------- Goal Definitions ----------------
 
-        # List of waypoints [(x, y, yaw_deg)]
-        self.goals = [
-            (700, 800, 0),
-            (700, 1400, 0),
-            (1500, 1400, 0),
-            (1500, 800, 0),
-            (700, 800, 0),
-        ]
-
         #----------------DO NOT CHNAGE----------------------
 
         # ---------------- PID Parameters ----------------
+        self.max_vel = 25
         self.pid_params = {
-            'x': {'kp': 0.0, 'ki': 0.00, 'kd': 0.0, 'max_out': self.max_vel},
-            'y': {'kp': 0.0, 'ki': 0.00, 'kd': 0.0, 'max_out': self.max_vel},
-            'theta': {'kp': 0.0, 'ki': 0.00, 'kd': 0.0, 'max_out': self.max_vel * 2}
+            'x': {'kp': 2.0, 'ki': 0.50, 'kd': 0.50, 'max_out': self.max_vel},
+            'y': {'kp': 2.0, 'ki': 0.50, 'kd': 0.50, 'max_out': self.max_vel},
+            'theta': {'kp': 2.0, 'ki': 0.50, 'kd': 0.50, 'max_out': self.max_vel*2}
         }
 
         # Initialize PIDs
@@ -95,19 +112,71 @@ class HolonomicPIDController(Node):
         # ---------------- ROS 2 Publishers & Subscribers ----------------
         
         # Write a subscriber for /bot_pose
+        self.subscribe = self.create_subscription(Poses2D, "/bot_pose", self.pose_cb, 10)
+        self.subscribe = self.create_subscription(Poses2D, "/bot_path", self.crate_cb, 10)
+        self.publisher = self.create_publisher(BotCmdArray, '/bot_cmd', 10)
+        self.subscribe = self.create_subscription(Poses2D, "/crate_pose", self.crate_call, 10)
+        self.status_pub = self.create_publisher(Int8, '/pick_status', 10)
+        # at end of __init__, after status_pub created
+        self._publish_pick_status(0)
 
-        self.publisher = self.create_publisher(
-            Float64MultiArray, '/forward_velocity_controller/commands', 10
-        )
+
+
+        # Create attach service client
+        self.attach_client = self.create_client(AttachLink, '/attach_link')
+        while not self.attach_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for /attach_link service...')
+
+        # Create detach service client
+        self.detach_client = self.create_client(DetachLink, '/detach_link')
+        while not self.detach_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for /detach_link service...')
         
+
+        self.attached = False 
+        self.mission_flag = 0   # 0 = not picked yet
+
+        # # Drop zone D1 rectangle (x_min, x_max, y_min, y_max)
+        self.D1 = {'x_min': 1020.0, 'x_max': 1410.0, 'y_min': 1075.0, 'y_max': 1355.0}
+        # Docking coordinate
+        self.dock = {'x': 1218.0, 'y': 205.0, 'w': 0.0}
+        self.path_target = None
+
+
         # ---------------- Timer for Control Loop ----------------
+        self.last_time = self.get_clock().now()
         self.timer = self.create_timer(0.03, self.control_cb)  # ~30ms = 33 Hz
 
-        self.get_logger().info(f'Holonomic PID Controller started. Goals: {self.goals}')
+                
+    def crate_cb(self, msg):    
+        if msg.poses:
+            pose = msg.poses[0]
+            self.crate_id = pose.id
+            self.crate_x = pose.x
+            self.crate_y = pose.y
+            yaw_deg = pose.w
+            self.crate_w = math.radians(yaw_deg)
+            self.get_logger().info(f"Crate → ID:{self.crate_id}, X:{self.crate_x:.2f}, Y:{self.crate_y:.2f}, Yaw:{yaw_deg:.2f}°")
+
+    def crate_call(self, msg):
+        if msg.poses:
+            pose = msg.poses[0]
+            self.actual_crate_id = pose.id
+            self.crate_box_x = pose.x
+            self.crate_box_y = pose.y        
+
 
 
     # ---------------- Subscriber Callback ----------------
     def pose_cb(self, msg):
+        if msg.poses:
+            pose = msg.poses[0]
+            self.pose_id = pose.id
+            self.pose_x = pose.x
+            self.pose_y = pose.y
+            yaw_deg = pose.w
+            self.pose_w = math.radians(yaw_deg)
+            self.get_logger().info(f"Pose → ID:{self.pose_id}, X:{self.pose_x:.2f}, Y:{self.pose_y:.2f}, Yaw:{yaw_deg:.2f}°")
         """
         Callback function for /bot_pose topic.
         This function is executed each time a message is received.
@@ -119,6 +188,9 @@ class HolonomicPIDController(Node):
 
     # ---------------- Control Loop ----------------
     def control_cb(self):
+        if (self.pose_x is None or self.pose_y is None or self.pose_w is None):
+            return
+
 
         """
         Control loop callback executed periodically by the ROS 2 timer.
@@ -135,8 +207,9 @@ class HolonomicPIDController(Node):
         9. Limit (clip) wheel velocities within safe bounds.
         10. Publish the wheel velocities to the motor controller.
         11. Check if the goal is reached:
-              - If yes → update goal index, reset PIDs, and move to the next goal.
+        - If yes → update goal index, reset PIDs, and move to the next goal.
         """
+
 
 
         # Time delta
@@ -145,6 +218,406 @@ class HolonomicPIDController(Node):
         if dt <= 0:
             return
         self.last_time = now
+        # ex = self.crate_x - self.pose_x
+        # ey = self.crate_y - self.pose_y
+
+                # ------------------ target selection ------------------
+        # Determine navigation target depending on mission state:
+        # - If not yet` attached -> target = crate_box (approach)
+        # - If attached and mission_flag == 1 -> target = D1 center (go to drop)
+        # - If mission_flag == 2 (dropped) -> target = dock
+        # - If perception publishes a path target, prefer that (self.path_target)
+
+
+        # if getattr(self, 'crate_cb', None) is not None:
+        #     # perception-generated path target (higher priority)
+        #     target_x = self.crate_x
+        #     target_y = self.crate_y
+        #     target_w = self.crate_w
+        #     self.get_logger().info(f"DBG target=({target_x:.1f},{target_y:.1f},yaw={math.degrees(target_w):.1f}), pose=({self.pose_x:.1f},{self.pose_y:.1f},yaw={math.degrees(self.pose_w):.1f})")
+
+        # else:
+        #     if self.attached and self.mission_flag == 1:
+        #         # go to D1 center
+        #         target_x = (self.D1['x_min'] + self.D1['x_max']) / 2.0
+        #         target_y = (self.D1['y_min'] + self.D1['y_max']) / 2.0
+        #         target_w = 0.0
+        #     elif self.mission_flag == 2 and not self.attached:
+        #         # after drop, return to dock
+        #         target_x = self.dock['x']
+        #         target_y = self.dock['y']
+        #         target_w = math.radians(self.dock.get('w', 0.0))
+        #     else:
+        #         # default: approach crate
+        #         target_x = getattr(self, 'crate_box_x', self.crate_x)
+        #         target_y = getattr(self, 'crate_box_y', self.crate_y)
+        #         target_w = self.crate_w
+
+        # ---------- TARGET SELECTION (explicit, simple priority) ----------
+        # If we've detached (mission_flag==2 and not attached) we *must* head to dock.
+
+        # Else if perception provided a path target, use it (only when both coords present)
+        if (getattr(self, 'crate_x', None) is not None) and (getattr(self, 'crate_y', None) is not None):
+            target_x = self.crate_x
+            target_y = self.crate_y
+            target_w = getattr(self, 'crate_w', 0.0)
+            self.get_logger().info(f"Using perception path target -> ({target_x:.1f},{target_y:.1f})")
+
+        elif (self.mission_flag == 2) and (not self.attached):
+            target_x = self.dock['x']
+            target_y = self.dock['y']
+            target_w = math.radians(self.dock.get('w', 0.0))
+            self.get_logger().info(f"Using DOCK target due to mission_flag==2 -> ({target_x:.1f},{target_y:.1f})")
+        # Fallback to default behaviour (approach crate box center if available)
+        else:
+            target_x = getattr(self, 'crate_box_x', None)
+            target_y = getattr(self, 'crate_box_y', None)
+            if (target_x is None) or (target_y is None):
+                # nothing known — bail out (safe fallback)
+                self.get_logger().warn("No valid target available; publishing zero velocities")
+                target_x = self.pose_x
+                target_y = self.pose_y
+                target_w = self.pose_w
+            else:
+                target_w = getattr(self, 'crate_w', 0.0)
+                self.get_logger().info(f"Using fallback target -> ({target_x:.1f},{target_y:.1f})")
+
+
+
+
+
+        # compute world-frame errors relative to target
+        ex = target_x - self.pose_x
+        ey = target_y - self.pose_y
+
+        # compute distance to the real crate center (used only for deciding attach)
+        bot = np.array([self.pose_x, self.pose_y])
+        crate_center = np.array([getattr(self, 'crate_box_x', self.crate_x), getattr(self, 'crate_box_y', self.crate_y)])
+        bot_crate_dist = np.linalg.norm(bot - crate_center)
+
+        # transform to body frame
+        ex_b = math.cos(self.pose_w) * ex + math.sin(self.pose_w) * ey
+        ey_b = -math.sin(self.pose_w) * ex + math.cos(self.pose_w) * ey
+        etheta = math.atan2(math.sin(target_w - self.pose_w), math.cos(target_w - self.pose_w))
+
+        ang_deadband = math.radians(3.0)    # if within 3°, consider aligned
+        ang_strict = math.radians(7.0)     # if beyond this, rotate-only
+
+        #TUNEEEEEEEEEEEEEEEEEEEEEE
+        # compute angle error as you already do: etheta
+        if abs(etheta) > ang_strict:
+            # force rotation-only behavior
+            VX = 0.0
+            VY = 0.0
+            # optionally reduce theta controller max_out or scale down output
+            # self.pid_x.reset()
+            # self.pid_y.reset()
+        else:
+            # normal PID on translation
+            VX = self.pid_x.compute(ex_b, dt)
+            VY = self.pid_y.compute(ey_b, dt)
+
+        # then compute w with theta PID, but add small deadband
+        w = self.pid_theta.compute(etheta, dt)
+        if abs(etheta) < ang_deadband:
+            w = 0.0
+            self.pid_theta.reset()   # clear integral to avoid windup
+
+
+        # wheel velocity mapping
+        D = 1
+        m1 = -D * w - 0.5 * VX + math.sin(math.pi / 3) * VY
+        m2 = -D * w - 0.5 * VX - math.sin(math.pi / 3) * VY
+        m3 = -D * w + 1 * VX
+
+                # --- SIMPLE DOCK ARRIVAL CHECK (replace existing complex logic) ---
+        # if (self.mission_flag == 2) and (not self.attached):
+        #     # simple Euclidean distance to dock
+        #     dock_dist = math.hypot(self.dock['x'] - self.pose_x, self.dock['y'] - self.pose_y)
+
+        #     # if within position AND angle tolerance -> stop and latch
+        #     if dock_dist <= self.dock_tolerance and abs(etheta) <= self.dock_angle_tol:
+        #         # stop motion immediately
+        #         m1 = m2 = m3 = 0.0
+        #         # base_angle = 0.0
+        #         # elbow_angle = 0.0
+
+        #         # clear controllers to avoid later wind-up / jerk
+        #         try:
+        #             self.pid_x.reset()
+        #             self.pid_y.reset()
+        #             self.pid_theta.reset()
+        #         except Exception:
+        #             pass
+
+        #         # mark stopped / at dock
+        #         self.at_dock = True
+        #         self.mission_flag = 3
+
+        #         # publish stop state once (uses your helper)
+        #         try:
+        #             self._publish_pick_status(3)
+        #         except Exception:
+        #             msg = Int8(); msg.data = 3; self.status_pub.publish(msg)
+
+        #         self.get_logger().info(f"Arrived at dock — stopping (dist={dock_dist:.2f}mm).")
+        #     # else: keep using computed m1/m2/m3 (no gentle slow-down here)
+
+        # --- ROBUST DOCK ARRIVAL CHECK (improved) ---
+        if (self.mission_flag == 2) and (not self.attached):
+
+            # Compute distance to dock and wrapped yaw error
+            dock_dx = self.dock['x'] - self.pose_x
+            dock_dy = self.dock['y'] - self.pose_y
+            dock_dist = math.hypot(dock_dx, dock_dy)
+            
+            dock_yaw_err = 0
+
+            # If we already latched at dock → stay stopped
+            if self.at_dock:
+                m1 = m2 = m3 = 0.0
+                base_angle = elbow_angle = 0.0
+                self.pid_x.reset(); self.pid_y.reset(); self.pid_theta.reset()
+                self._publish_pick_status(3)
+                return
+
+            # Check tolerance (distance + angle)
+            if (dock_dist <= self.dock_tolerance):
+                # Stop and latch
+                m1 = m2 = m3 = 0.0
+                base_angle = elbow_angle = 0.0
+                self.pid_x.reset(); self.pid_y.reset(); self.pid_theta.reset()
+
+                self.at_dock = True
+                self.mission_flag = 3
+
+                self.get_logger().info(
+                    f"Arrived at dock ({self.pose_x:.1f}, {self.pose_y:.1f}, yaw={math.degrees(self.pose_w):.1f}) "
+                    f"dist={dock_dist:.2f} mm, stopping permanently."
+                )
+
+                self._publish_pick_status(3)
+                return
+
+            # Else: normal motion toward dock
+            self.get_logger().debug(
+                f"Docking... dist={dock_dist:.1f}, yaw_err={math.degrees(dock_yaw_err):.1f}°"
+            )
+
+        
+
+
+
+        # ------------------ Attach: when near actual crate (pre-pick) ------------------
+        if bot_crate_dist <= 120 and not self.attached:
+            # stop wheels and lower arm to pick
+            m1 = m2 = m3 = 0.0
+            base_angle = 90.0
+            elbow_angle = 90.0
+            self.get_logger().info(f"Crate reached — stopping for attach (dist={bot_crate_dist:.2f})")
+            if not getattr(self, 'attach_attempted', False):
+                self.attach_attempted = True
+                self.get_logger().info("Attempting to attach crate")
+                self.call_attach_service()
+            # publish cmd (arm down, wheels zero) at end of function
+
+        # ------------------ If attached: move toward D1 (do NOT zero wheels unless performing detach) ------------------
+        elif self.attached:
+            base_angle = 60.0
+            elbow_angle = 55.0
+            # If inside D1 region, attempt detach once
+            if (self.D1['x_min'] <= self.pose_x <= self.D1['x_max'] and
+                self.D1['y_min'] <= self.pose_y <= self.D1['y_max']):
+                self.get_logger().info("Inside D1 zone — attempting detach")
+                if not getattr(self, 'detach_attempted', False):
+                    self.detach_attempted = True
+                    self.call_detach_service()
+            # wheels keep computed velocities (so robot actually travels to D1)
+
+        # ------------------ Default: normal navigation toward the chosen target ------------------
+        else:
+            base_angle = 0.0
+            elbow_angle = 0.0
+            # keep wheel velocities computed above
+            self.get_logger().debug(
+                f"Wheel Velocities → m1: {m1:.2f}, m2: {m2:.2f}, m3: {m3:.2f}, "
+                f"VX: {VX:.2f}, VY: {VY:.2f}, w: {w:.2f}, Dist(crate): {bot_crate_dist:.2f}"
+            )
+
+
+
+        # bot=np.array([self.pose_x, self.pose_y])
+        # crate=np.array([self.crate_box_x, self.crate_box_y])
+        # bot_crate_dist=np.linalg.norm(bot-crate)
+
+        # etheta = math.atan2(math.sin(self.crate_w - self.pose_w), math.cos(self.crate_w - self.pose_w))
+
+        # #Transform world error to body frame
+        # ex_b = math.cos(self.pose_w) * ex + math.sin(self.pose_w) * ey
+        # ey_b = -math.sin(self.pose_w) * ex + math.cos(self.pose_w) * ey
+
+        # #PID compute 
+        # VX = self.pid_x.compute(ex_b, dt)
+        # VY = self.pid_y.compute(ey_b, dt)
+        # w = self.pid_theta.compute(etheta, dt)
+
+        # #wheel velocity calculation
+        # D = 1
+
+        # m1 = -D * w - 0.5 * VX + math.sin(math.pi / 3) * VY
+        # m2 = -D * w - 0.5 * VX - math.sin(math.pi / 3) * VY
+        # m3 = -D * w + 1 * VX
+
+        # # # Normalize wheel speeds
+        # # wheel_speeds = [m1, m2, m3]
+        # # max_w = max(abs(w) for w in wheel_speeds)
+        # # if max_w > self.max_vel:
+        # #     scale = self.max_vel / max_w
+        # #     wheel_speeds = [w * scale for w in wheel_speeds]
+
+        # # Log the calculated velocities
+        # if bot_crate_dist <= 140 and not self.attached :
+        #     m1 = m2 = m3 = 0.0
+        #     base_angle = 90.0
+        #     elbow_angle = 90.0
+        #     self.get_logger().info(f" Crate reached — stopping motors (dist={bot_crate_dist:.2f})")
+
+        #     if not hasattr(self, 'attach_attempted') or not self.attach_attempted :
+        #         self.attach_attempted = True
+        #         self.get_logger().info("Attempting to attach crate")
+
+        #         self.call_attach_service()
+            
+
+        # elif self.attached :
+        #     base_angle = 20.0
+        #     elbow_angle = 20.0
+        #     self.get_logger().info("Crate attached - holding arm at 20")
+        #     m1 = m2 = m3 = 0.0
+
+        # if self.attached:
+        #     # existing arm/hold behavior (already in your file)
+        #     base_angle = 20.0
+        #     elbow_angle = 20.0
+        #     self.get_logger().info("Crate attached - holding arm at 20")
+        #     m1 = m2 = m3 = 0.0
+
+        # # check if we are inside D1 (use robot pose)NEEED TO CHECKKK
+        #     if (self.D1['x_min'] <= self.pose_x <= self.D1['x_max'] and
+        #         self.D1['y_min'] <= self.pose_y <= self.D1['y_max']):
+        #         self.get_logger().info("Inside D1 zone — attempting detach")
+        #         # only call detach once per arrival
+        #         if not getattr(self, 'detach_attempted', False):
+        #             self.detach_attempted = True
+        #             self.call_detach_service()
+
+        # else:
+        #     base_angle = 0.0
+        #     elbow_angle = 0.0
+        #     self.get_logger().info(
+        #         f"Wheel Velocities → m1: {m1:.2f}, m2: {m2:.2f}, m3: {m3:.2f}, "
+        #         f"VX: {VX:.2f}, VY: {VY:.2f}, w: {w:.2f}, Dist: {bot_crate_dist:.2f}"
+        #     )
+
+        if (self.actual_crate_id%3 == 0):
+            self.name="crate_red_"+str(self.actual_crate_id)
+        elif (self.actual_crate_id%3 == 1):
+            self.name="crate_green_"+str(self.actual_crate_id)
+        else:
+            self.name="crate_blue_"+str(self.actual_crate_id)
+
+        self.link="box_link_"+str(self.actual_crate_id)
+
+        # Publish to /bot_cmd
+        cmd_msg = BotCmdArray()
+        cmd = BotCmd()
+        cmd.id = 0
+        cmd.m1 = float(m1)
+        cmd.m2 = float(m2)
+        cmd.m3 = float(m3)
+        cmd.base = base_angle
+        cmd.elbow = elbow_angle
+        cmd_msg.cmds.append(cmd)
+
+        self.publisher.publish(cmd_msg)   
+
+    def _publish_pick_status(self, value:int):
+        """Publish pick status only when it changes (1=attached,2=dropped,0=idle)."""
+        if value == self._last_published_status:
+            return
+        msg = Int8()
+        msg.data = int(value)
+        self.status_pub.publish(msg)
+        self._last_published_status = int(value)
+
+
+    def call_attach_service(self):
+        """Send the JSON string in the 'data' field of AttachLink service."""
+        req = AttachLink.Request()
+        req.data = json.dumps({
+            "model1_name": "hb_crystal",
+            "link1_name": "arm_link_2",
+            "model2_name": self.name,
+            "link2_name": self.link
+        })   
+
+        future = self.attach_client.call_async(req)
+        future.add_done_callback(self.attach_callback)
+
+    def call_detach_service(self):
+        """Send the JSON string in the 'data' field of DetachLink service."""
+        req = DetachLink.Request()
+        req.data = json.dumps({
+            "model1_name": "hb_crystal",
+            "link1_name": "arm_link_2",
+            "model2_name": getattr(self, "attached_model", self.name),   # ← use frozen values if available
+            "link2_name": getattr(self, "attached_link", self.link)
+        })
+        future = self.detach_client.call_async(req)
+        future.add_done_callback(self.detach_callback)
+
+    def attach_callback(self, future):
+        try:
+            result = future.result()
+            if result.success:
+                self.attached = True
+                self.mission_flag = 1                 # mark that crate was picked
+                self.attached_model = self.name          # ← NEW: freeze model name
+                self.attached_link  = self.link  
+                self.attached_model = self.name
+                self.attached_link  = self.link  
+                self.get_logger().info(f" Successfully attached: {result.message}")
+                self._publish_pick_status(1)   # publish attached state
+            else:
+                self.attached = False
+                self.attach_attempted = False
+                self.get_logger().warn(f" Attach failed: {result.message}")
+        except Exception as e:
+            self.get_logger().error(f"AttachLink service call failed: {e}")  
+
+    def detach_callback(self, future):
+        try:
+            result = future.result()
+            if result.success:
+                self.attached = False
+                # If we were carrying (mission_flag==1), update to dropped (2)
+                if self.mission_flag == 1:
+                    self.mission_flag = 2
+                # publish new mission state (2 => dropped)
+                self.crate_x = None
+                self.crate_y = None
+                self.crate_w = None
+                self.get_logger().info("Successfully detached")
+                self._publish_pick_status(2)
+            else:
+                self.get_logger().warn(f"Detach failed: {result.message}")
+                # you can retry once if wanted: set detach_attempted False and call again elsewhere
+                self.detach_attempted = False
+        except Exception as e:
+            self.get_logger().error(f"DetachLink service call failed: {e}")
+            self.detach_attempted = False
+
+        
 
         # Current robot pose
 
@@ -163,13 +636,7 @@ class HolonomicPIDController(Node):
         # Goal check
 
 
-    # ---------------- Publisher ----------------
-    def publish_wheel_velocities(self, wheel_vel):
-        # Wheel velocity array (Float64MultiArray)
-        # Order: [Left wheel speed, Right wheel speed, Rear wheel speed]
-        msg = Float64MultiArray()
-        msg.data = np.array(wheel_vel).tolist()
-        self.publisher.publish(msg)
+    
 
 
 # ---------------------- Main Function -------------------------------------
