@@ -5,7 +5,7 @@
 </h3>
 
 <p align="center">
-  ROS 2 • Computer Vision • Holonomic Robotics
+  ROS 2 • Computer Vision
 </p>
 
 ## Table of Contents
