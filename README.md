@@ -1,1 +1,15 @@
-hb_ws2 folder for EYRC Holo Battalion 25-26 for Task 2a 2b
+<h1 align="center">HOLO BATTALION</h1>
+
+<h3 align="center">
+  Multi-Robot Autonomous Warehouse Automation
+</h3>
+
+<p align="center">
+  ROS 2 • Computer Vision • Holonomic Robotics
+</p>
+
+# About the Project
+
+Holo Battalion is a ROS 2-based multi-robot automation project developed as part of the e-Yantra Robotics Competition 2025–26. The project simulates an autonomous warehouse environment in which three holonomic robots — Glacio, Crystal, and Frostbite — perform perception, navigation, manipulation, and coordinated pick-and-place operations.
+The system progressively develops from individual robot control and pose estimation to autonomous material handling and multi-robot coordination. The project involves computer vision, ROS 2 communication, holonomic drive control, robotic manipulation, and coordination between multiple autonomous robots.
+
